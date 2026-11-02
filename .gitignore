@@ -1,0 +1,9 @@
+# Raw Yelp files are too large for GitHub
+data/raw/
+*.zip
+*.tar
+
+.Rproj.user/
+.Rhistory
+.RData
+.DS_Store
