@@ -100,3 +100,4 @@ saveRDS(
 # Step 4: check file sizes (GitHub blocks files over 100 MB)
 
 file.size(list.files("data/new_orleans", full.names = TRUE)) / 1e6   # MB
+
