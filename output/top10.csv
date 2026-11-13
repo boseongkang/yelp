@@ -1,0 +1,11 @@
+rank,business_name,cuisine,neighborhood,reviews_all,avg_stars_all,n_eligible,avg_normalized
+1,The Wandering Buddha,Korean,St. Roch,45,4.511111111111111,7,0.8233411325516589
+2,Yo Nashi,Japanese,Central Business District,40,4.45,6,0.7707431457431456
+3,Nagomi,Japanese,St. Claude,24,4.958333333333333,10,0.7273410799726588
+4,Mister Mao,Chinese,West Riverside,29,4.655172413793103,8,0.6692911255411257
+5,Foodies Destination,Korean,Tulane - Gravier,20,4.6,5,0.6485327903091063
+6,Oishii Sushi House,Japanese,Tall Timbers - Brechtel,82,4.475609756097561,10,0.5825407925407926
+7,Asuka Sushi & Hibachi,Japanese,Gert Town,316,4.401898734177214,45,0.4315740722603467
+8,Gyu-Kaku Japanese BBQ,Japanese,Central Business District,334,4.389221556886228,46,0.39280636729149315
+9,Union Ramen,Japanese,Lower Garden District,156,4.371794871794871,30,0.36290764790764796
+10,Blue Giant,Chinese,Lower Garden District,194,4.1340206185567014,46,0.32905803832577285

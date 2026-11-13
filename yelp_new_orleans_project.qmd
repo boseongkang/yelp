@@ -1,0 +1,1097 @@
+---
+title: "Where to Find the Best East Asian Food in New Orleans"
+subtitle: "Yelp Open Dataset: large file import, joins, spatial analysis, and reviewer adjusted ratings"
+author: "Boseong Kang"
+date: last-modified
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+    output-file: index.html
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(tidyverse)
+library(sf)
+library(tigris)
+library(knitr)
+library(ggrepel)
+
+options(tigris_use_cache = TRUE)
+dir.create("figures", showWarnings = FALSE)
+dir.create("output", showWarnings = FALSE)
+dir.create("data/boundaries", recursive = TRUE, showWarnings = FALSE)
+```
+
+## Research question
+
+**Where can someone find the best East Asian (Korean, Japanese, and Chinese) restaurants in New Orleans, and which neighborhood is best for finding them?**
+
+"Best" is defined with four kinds of evidence: the ordinary Yelp average from all reviewers, the number of reviews, a reviewer adjusted score that removes each reviewer's usual generosity or strictness, and a minimum amount of evidence before a restaurant or neighborhood can be ranked.
+
+```{r}
+#| label: load-data
+#| include: false
+nola <- readRDS("data/new_orleans/business_new_orleans.rds")
+reviews <- readRDS("data/new_orleans/reviews_new_orleans.rds")
+```
+
+The executive summary is at the [end of the analysis](#executive-summary) so that every number in it is computed first.
+
+## Data and large data management
+
+### Source
+
+The data are the Yelp Open Dataset (business and review files, JSON with one record per line). The download contains:
+
+| File | Size | Used |
+|---|---:|---|
+| `yelp_academic_dataset_business.json` | 113 MB | yes |
+| `yelp_academic_dataset_review.json` | 5.0 GB | yes |
+| `yelp_academic_dataset_user.json` | 3.1 GB | no |
+| `yelp_academic_dataset_checkin.json` | 274 MB | no |
+| `yelp_academic_dataset_tip.json` | 172 MB | no |
+
+### Problems and solutions
+
+1. **Nested archives and disk space.** The browser downloaded a 4.0 GB zip file. macOS extracted it into a folder that contained the tar file Yelp lists as 4.35 GB (4.34 GB in Finder), which expands to 8.65 GB of JSON. While extracting, the zip, the tar, and the JSON files existed at the same time (about 17 GB). I moved only the tar file into `data/raw/` and extracted it there. After extraction the zip and the tar are no longer needed, and the checkin and tip files are not used by this project, so they were removed to free space.
+2. **The review file is too large to read at once.** The review file has 6,990,280 reviews (5.0 GB). Reading it with a plain `stream_in()` would build the whole table in memory. Instead, `stream_in()` was given a handler function that reads 50,000 lines at a time and keeps only reviews for New Orleans restaurants, so memory holds one 50,000 line chunk plus the small filtered table instead of all 7 million reviews. The final count, 6,990,280 records read, matches Yelp's published review count, which confirms that the complete file was processed and not a sample. The work was done on an Apple silicon Mac; because the review file was read in chunks from the first attempt, the import never ran out of memory, and the only real constraints were disk space and waiting time.
+3. **Keeping only what is needed.** Only the columns used later were kept (11 business columns, 9 review columns), which reduced 150,346 businesses to 2,259 New Orleans restaurants and 6,990,280 reviews to 476,421.
+4. **Saving the filtered data.** The filtered tables were saved as `xz` compressed RDS files in `data/new_orleans/`. Every later step reads these files, so the raw JSON is needed only once.
+5. **GitHub limits.** The raw JSON files are listed in `.gitignore` and are not in the repository. The review RDS file is 78 MB; GitHub warned that it is above the recommended 50 MB, but it is below the 100 MB hard limit, so it was committed once and is not rewritten, because every new version would add another 78 MB to the repository history.
+
+### Import code
+
+The import runs once from [`R/import.R`](https://github.com/boseongkang/yelp/blob/main/R/import.R). It is shown here but not run when this report is rendered, because the raw files are not part of the repository.
+
+```{r}
+#| label: show-import
+#| eval: false
+#| file: R/import.R
+```
+
+### Definition of a New Orleans restaurant
+
+A business is a New Orleans restaurant if Yelp lists `state == "LA"`, `city == "New Orleans"`, and the word "Restaurants" appears in its categories. Step 5 then checks this text label against the official city boundary.
+
+```{r}
+#| label: data-size
+tibble(
+  n_restaurants = nrow(nola),
+  n_reviews = nrow(reviews),
+  n_reviewers = n_distinct(reviews$user_id)
+) |>
+  kable(caption = "Filtered New Orleans data used in this report")
+```
+
+## Step 3: Selecting related categories
+
+### Splitting the category field
+
+```{r}
+#| label: categories
+restaurant_categories <- nola |>
+  select(business_id, categories) |>
+  separate_rows(categories, sep = ",") |>
+  mutate(category = str_to_lower(str_squish(categories))) |>
+  filter(category != "") |>
+  distinct(business_id, category)
+
+category_counts <- restaurant_categories |>
+  count(category, sort = TRUE)
+
+category_counts |>
+  slice_head(n = 15) |>
+  kable(caption = "Most common categories among New Orleans restaurants")
+```
+
+### From Korean food to East Asian food
+
+I started with Korean food, but only 6 New Orleans restaurants carry the Korean category, which is below the project minimum of 10 restaurants in 7 areas. I widened the theme to the East Asian food tradition Korean food belongs to: Korean, Japanese, and Chinese, plus their sub styles (sushi bars and ramen for Japanese; dim sum, Szechuan, and Taiwanese for Chinese). Southeast Asian categories (Vietnamese, Thai) and labels without a nationality (Asian Fusion, Noodles, Poke) are excluded so the group stays consistent.
+
+```{r}
+#| label: category-choice
+core_categories <- c("korean", "japanese", "chinese")
+sub_categories <- c("sushi bars", "ramen", "dim sum", "szechuan", "taiwanese")
+selected_categories <- c(core_categories, sub_categories)
+considered <- c(selected_categories, "vietnamese", "thai", "asian fusion",
+                "noodles", "poke")
+
+category_counts |>
+  filter(category %in% considered) |>
+  mutate(decision = if_else(category %in% selected_categories,
+                            "included", "excluded")) |>
+  kable(caption = "Asian categories considered")
+```
+
+```{r}
+#| label: fig-categories
+#| fig-cap: "Asian categories in New Orleans; red bars are included in the East Asian group"
+#| fig-width: 7
+#| fig-height: 4
+category_counts |>
+  filter(category %in% considered) |>
+  mutate(
+    decision = if_else(category %in% selected_categories, "Included", "Excluded"),
+    category = fct_reorder(str_to_title(category), n)
+  ) |>
+  ggplot(aes(x = n, y = category, fill = decision)) +
+  geom_col() +
+  scale_fill_manual(values = c(Included = "#C0392B", Excluded = "grey70")) +
+  labs(title = "Asian Restaurant Categories in New Orleans",
+       x = "Number of restaurants", y = NULL, fill = NULL) +
+  theme_minimal()
+```
+
+### Co-occurrence
+
+```{r}
+#| label: cooccurrence
+selected_category_rows <- restaurant_categories |>
+  filter(category %in% selected_categories)
+
+selected_category_rows |>
+  inner_join(selected_category_rows, by = "business_id",
+             relationship = "many-to-many") |>
+  filter(category.x < category.y) |>
+  count(category.x, category.y, sort = TRUE, name = "restaurants") |>
+  kable(caption = "Pairs of selected categories on the same restaurant")
+```
+
+Sushi bars and ramen appear mostly together with Japanese, and dim sum, Szechuan, and Taiwanese with Chinese, which supports treating them as sub styles of the three core cuisines. The three core cuisines themselves rarely share a restaurant (Chinese and Japanese appear together on only 2), so the co-occurrence table supports the sub style grouping, while grouping Korean, Japanese, and Chinese together rests on their shared East Asian food tradition rather than on Yelp tags.
+
+### Inclusion rule
+
+A restaurant is included if:
+
+1. it has **at least one** of the selected East Asian categories, and
+2. it does **not** also carry a cuisine category that is outside the theme: Vietnamese, Thai, Cajun/Creole, Latin American, Peruvian, Mexican, or Hawaiian.
+
+The second condition was added after a first version of the ranking (see [AI prompts](#ai-prompts-and-how-i-reprompted), case 9). With only the first condition, Yelp's secondary tags pulled in restaurants whose main identity is not East Asian, such as a seafood and Cajun restaurant tagged "Chinese", a Peruvian restaurant tagged "Japanese", and a Vietnamese bakery tagged "Chinese", and four of them reached the top 10. Vietnamese and Thai were already declared outside the theme above, so a restaurant that is also labeled with them is treated as ambiguous and left out. Hawaiian was added after the second version of the ranking still contained two poke bowl shops; poke had been declared outside the theme in the category choice, and in this data every poke shop with a Japanese or sushi tag also carries the Hawaiian tag. The Homework 6 file [analysis.md](https://github.com/boseongkang/yelp/blob/main/analysis.md) used only the first condition (145 restaurants), so its counts differ from this report.
+
+Each included restaurant gets one cuisine label for maps (Korean first, then Japanese, then Chinese).
+
+```{r}
+#| label: inclusion
+outside_theme <- c("vietnamese", "thai", "cajun/creole", "latin american",
+                   "peruvian", "mexican", "hawaiian")
+
+east_asian_ids <- selected_category_rows |>
+  distinct(business_id)
+
+conflicting <- restaurant_categories |>
+  semi_join(east_asian_ids, by = "business_id") |>
+  filter(category %in% outside_theme) |>
+  group_by(business_id) |>
+  summarise(other_cuisines = paste(sort(category), collapse = ", "), .groups = "drop")
+
+conflicting |>
+  left_join(nola |> select(business_id, business_name), by = "business_id") |>
+  select(business_name, other_cuisines) |>
+  arrange(business_name) |>
+  kable(caption = "Restaurants excluded because they also carry an outside the theme cuisine")
+
+tibble(
+  step = c("At least one East Asian category", "Excluded (outside the theme cuisine)", "Included"),
+  restaurants = c(nrow(east_asian_ids), nrow(conflicting),
+                  nrow(east_asian_ids) - nrow(conflicting))
+) |>
+  kable(caption = "Inclusion rule")
+
+selected_restaurants <- nola |>
+  semi_join(east_asian_ids, by = "business_id") |>
+  anti_join(conflicting, by = "business_id") |>
+  mutate(
+    cat_lower = str_to_lower(categories),
+    cuisine = case_when(
+      str_detect(cat_lower, "korean") ~ "Korean",
+      str_detect(cat_lower, "japanese|sushi bars|ramen") ~ "Japanese",
+      str_detect(cat_lower, "chinese|dim sum|szechuan|taiwanese") ~ "Chinese"
+    )
+  ) |>
+  select(-cat_lower)
+
+selected_restaurants |>
+  count(cuisine) |>
+  kable(caption = "Selected East Asian restaurants")
+```
+
+Six restaurants carry the Korean tag, but `r sum(conflicting$business_id %in% restaurant_categories$business_id[restaurant_categories$category == "korean"])` of them are excluded by the outside the theme rule (see the table above), so `r sum(selected_restaurants$cuisine == "Korean")` remain in the Korean group.
+
+## Step 4: Joining businesses to reviews
+
+Reviews are filtered to the selected restaurants before any further work.
+
+```{r}
+#| label: join-reviews
+east_asian_reviews <- reviews |>
+  semi_join(selected_restaurants, by = "business_id")
+
+tibble(
+  restaurants = nrow(selected_restaurants),
+  reviews = nrow(east_asian_reviews),
+  reviewers = n_distinct(east_asian_reviews$user_id)
+) |>
+  kable(caption = "Business to review join")
+```
+
+## Step 5: Checking the city label with the official boundary
+
+```{r}
+#| label: places
+la_places <- places(state = "LA", cb = TRUE, year = 2024, class = "sf") |>
+  st_transform(4326)
+
+new_orleans_boundary <- la_places |>
+  filter(NAME == "New Orleans")
+
+all_with_place <- nola |>
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE) |>
+  st_join(la_places |> select(place_name = NAME), join = st_within, left = TRUE) |>
+  st_drop_geometry()
+
+all_with_place |>
+  count(city, place_name, sort = TRUE) |>
+  kable(caption = "Yelp city label compared with the Census place")
+```
+
+```{r}
+#| label: mismatch-zip
+all_with_place |>
+  filter(place_name != "New Orleans" | is.na(place_name)) |>
+  count(postal_code, sort = TRUE) |>
+  kable(caption = "ZIP codes of restaurants outside the New Orleans boundary")
+```
+
+Of the 2,259 restaurants Yelp labels "New Orleans", 2,202 are inside the official boundary. Almost all of the others have suburban ZIP codes (70123, 70121, 70001, 70005 and others), so the mismatch comes from New Orleans mailing addresses used in neighboring places, mostly in Jefferson Parish. One restaurant has the Uptown New Orleans ZIP code 70115 but coordinates just outside the boundary, which looks like a coordinate or boundary edge issue. These restaurants are kept in the data, reported as unmatched in Step 6, and left out of the neighborhood analysis.
+
+## Step 6: Choosing a geographic system
+
+Three systems were compared: City of New Orleans Neighborhood Statistical Areas (data.nola.gov, dataset `exvn-jeh2`), Orleans Parish Census tracts (2024), and ZIP Code Tabulation Areas (2020) that overlap the city.
+
+```{r}
+#| label: boundaries
+nsa_file <- "data/boundaries/neighborhood_statistical_areas.geojson"
+
+if (!file.exists(nsa_file)) {
+  nsa_urls <- c(
+    "https://data.nola.gov/api/geospatial/exvn-jeh2?method=export&format=GeoJSON",
+    "https://data.nola.gov/api/v3/views/exvn-jeh2/query.geojson?accessType=DOWNLOAD"
+  )
+  for (u in nsa_urls) {
+    ok <- tryCatch({
+      download.file(u, nsa_file, mode = "wb", quiet = TRUE)
+      file.size(nsa_file) > 1000
+    }, error = function(e) FALSE)
+    if (isTRUE(ok)) break
+    if (file.exists(nsa_file)) unlink(nsa_file)
+  }
+}
+
+nsa_raw <- st_read(nsa_file, quiet = TRUE) |>
+  st_make_valid() |>
+  st_transform(4326)
+nsa_name_col <- grep("gnocdc_lab", names(nsa_raw), ignore.case = TRUE, value = TRUE)[1]
+nsa <- nsa_raw |>
+  transmute(area_name = str_to_title(.data[[nsa_name_col]]))
+
+tracts_orleans <- tracts(state = "LA", county = "Orleans", cb = TRUE,
+                         year = 2024, class = "sf") |>
+  st_transform(4326) |>
+  transmute(area_name = paste("Tract", NAME))
+
+zcta_raw <- zctas(cb = TRUE, year = 2020, starts_with = c("700", "701"),
+                  class = "sf") |>
+  st_transform(4326)
+zcta_col <- grep("^ZCTA5CE", names(zcta_raw), value = TRUE)[1]
+zcta_nola <- zcta_raw |>
+  st_filter(new_orleans_boundary, .predicate = st_intersects) |>
+  transmute(area_name = .data[[zcta_col]])
+
+boundary_systems <- list(
+  "Neighborhood Statistical Area" = nsa,
+  "Census tract" = tracts_orleans,
+  "ZIP/ZCTA" = zcta_nola
+)
+```
+
+```{r}
+#| label: spatial-join
+selected_points <- selected_restaurants |>
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE)
+
+assign_areas <- function(points, boundaries) {
+  points |>
+    st_join(boundaries, join = st_within, left = TRUE) |>
+    st_drop_geometry() |>
+    distinct(business_id, .keep_all = TRUE)
+}
+
+assigned <- map(boundary_systems, \(b) assign_areas(selected_points, b))
+
+summarise_system <- function(assigned_df, boundaries, system_name) {
+  per_area <- assigned_df |>
+    filter(!is.na(area_name)) |>
+    count(area_name)
+  tibble(
+    `Geographic system` = system_name,
+    `Number of areas` = nrow(boundaries),
+    `Areas with a restaurant` = nrow(per_area),
+    `Restaurants assigned` = sum(!is.na(assigned_df$area_name)),
+    `Unmatched restaurants` = sum(is.na(assigned_df$area_name)),
+    `Smallest area count` = min(per_area$n),
+    `Median area count` = median(per_area$n),
+    `Largest area count` = max(per_area$n),
+    `Areas with 5 or more` = sum(per_area$n >= 5)
+  )
+}
+
+comparison_table <- imap(assigned, \(a, sys) summarise_system(a, boundary_systems[[sys]], sys)) |>
+  list_rbind()
+
+comparison_table |>
+  kable(caption = "Comparison of geographic systems (East Asian restaurants)")
+
+cmp <- function(sys, col) comparison_table[[col]][comparison_table$`Geographic system` == sys]
+```
+
+```{r}
+#| label: area-raw
+area_summary <- function(assigned_df) {
+  assigned_df |>
+    filter(!is.na(area_name)) |>
+    group_by(area_name) |>
+    summarise(
+      restaurants = n(),
+      avg_business_stars = round(mean(stars, na.rm = TRUE), 2),
+      .groups = "drop"
+    ) |>
+    arrange(desc(restaurants))
+}
+area_results <- map(assigned, area_summary)
+```
+
+The five areas with the most East Asian restaurants under each system, with the average Yelp business rating of their restaurants:
+
+```{r}
+#| label: area-tables
+#| results: asis
+for (sys in names(area_results)) {
+  cat("\n\n**", sys, "**\n\n", sep = "")
+  cat(kable(slice_head(area_results[[sys]], n = 5), format = "pipe",
+            col.names = c("Area", "Restaurants", "Average business stars")),
+      sep = "\n")
+  cat("\n")
+}
+```
+
+The reviewer adjusted rating is computed in Step 7 for neighborhoods (section "Which neighborhood is best?") and for ZIP codes (section "Cross check with ZIP codes"). It is not computed for tracts, because only `r cmp("Census tract", "Areas with 5 or more")` tracts have 5 or more East Asian restaurants, too few for a ranking.
+
+```{r}
+#| label: map-function
+bbox_city <- st_bbox(new_orleans_boundary)
+
+map_system <- function(boundaries, area_df, system_name) {
+  boundaries |>
+    left_join(area_df |> select(area_name, restaurants), by = "area_name") |>
+    mutate(restaurants = replace_na(restaurants, 0)) |>
+    ggplot() +
+    geom_sf(aes(fill = restaurants), color = "white", linewidth = 0.2) +
+    geom_sf(data = selected_points, size = 0.8, color = "black", alpha = 0.6) +
+    scale_fill_viridis_c(option = "C", direction = -1) +
+    coord_sf(xlim = bbox_city[c("xmin", "xmax")], ylim = bbox_city[c("ymin", "ymax")]) +
+    labs(title = paste("East Asian Restaurants by", system_name),
+         subtitle = "Fill = restaurants in the area; dots = restaurants",
+         fill = "Restaurants") +
+    theme_minimal()
+}
+
+```
+
+```{r}
+#| label: fig-map-nsa
+#| fig-cap: "East Asian restaurants per Neighborhood Statistical Area"
+#| fig-width: 8
+#| fig-height: 6
+map_system(nsa, area_results[["Neighborhood Statistical Area"]], "Neighborhood Statistical Area")
+```
+
+```{r}
+#| label: fig-map-tract
+#| fig-cap: "East Asian restaurants per Census tract"
+#| fig-width: 8
+#| fig-height: 6
+map_system(tracts_orleans, area_results[["Census tract"]], "Census Tract")
+```
+
+```{r}
+#| label: fig-map-zcta
+#| fig-cap: "East Asian restaurants per ZIP Code Tabulation Area"
+#| fig-width: 8
+#| fig-height: 6
+map_system(zcta_nola, area_results[["ZIP/ZCTA"]], "ZIP Code Tabulation Area")
+```
+
+### Decision: Neighborhood Statistical Areas
+
+**The main analysis uses Neighborhood Statistical Areas (NSA), and only neighborhoods with at least 5 East Asian restaurants are ranked.**
+
+1. **The areas match the question.** The question asks where a person should go, and NSAs are official city neighborhoods with names people use (French Quarter, Marigny, Central Business District). A ZIP code or "Tract 134" means little to a visitor.
+2. **Census tracts are smaller than neighborhoods.** The median is `r cmp("Census tract", "Median area count")` East Asian restaurant(s) per tract and `r cmp("Neighborhood Statistical Area", "Median area count")` per neighborhood, but tracts split the same restaurants over `r cmp("Census tract", "Areas with a restaurant")` areas instead of `r cmp("Neighborhood Statistical Area", "Areas with a restaurant")`, which leaves `r cmp("Census tract", "Areas with 5 or more")` tracts with 5 or more restaurants against `r cmp("Neighborhood Statistical Area", "Areas with 5 or more")` neighborhoods. Tracts are also designed for population counts, and their numbers mean nothing to a visitor.
+3. **ZIP codes are stable but are not neighborhoods.** They give the largest counts (median `r cmp("ZIP/ZCTA", "Median area count")` per ZIP code), but they are postal areas, and the ones touching New Orleans extend into Jefferson Parish. Their lower unmatched count (`r cmp("ZIP/ZCTA", "Unmatched restaurants")` against `r cmp("Neighborhood Statistical Area", "Unmatched restaurants")` for neighborhoods) comes from including restaurants outside the city, not from better matching.
+4. **The minimum of 5 handles small counts.** Neighborhoods below 5 restaurants appear on maps but are not ranked.
+5. **Maps and documentation.** The neighborhood map (above) shows where restaurants cluster at a scale where each area is still visible and can be named. The tract map splits the same clusters into many small areas with 0 or 1 restaurants, and the ZIP map merges them into a few large areas that cross the city limit. NSA names and boundaries are published by the City of New Orleans with a stable identifier (`exvn-jeh2`), so a reader can look up any area named in this report.
+
+```{r}
+#| label: minimum-rule
+nsa_counts <- area_results[["Neighborhood Statistical Area"]]
+
+map(c(3, 5, 10), \(k) tibble(
+  minimum_restaurants = k,
+  neighborhoods_ranked = sum(nsa_counts$restaurants >= k),
+  restaurants_covered = sum(nsa_counts$restaurants[nsa_counts$restaurants >= k])
+)) |>
+  list_rbind() |>
+  kable(caption = "Effect of the minimum restaurant rule")
+```
+
+The minimum of 5 was set in Homework 6, before the reviewer analysis, and is not changed here. A minimum of 3 would let three restaurants decide a neighborhood's average, and a minimum of 10 would rank only `r sum(nsa_counts$restaurants >= 10)` neighborhood(s).
+
+**Project requirement.** The selected restaurants must include at least 10 restaurants spread over at least 7 areas. The `r sum(nsa_counts$restaurants)` restaurants inside the city fall in `r nrow(nsa_counts)` different neighborhoods, so the requirement is met. This is separate from the number of neighborhoods that are ranked: Homework 6 described the 8 ranked neighborhoods as meeting the 7 area requirement, which mixed up the two ideas.
+
+**What this choice reveals and hides.** Neighborhoods reveal where East Asian restaurants cluster and let the report name places a visitor can find. They also hide a lot: only `r sum(nsa_counts$restaurants >= 5)` of the `r nrow(nsa_counts)` neighborhoods with an East Asian restaurant can be ranked, and `r sum(nsa_counts$restaurants[nsa_counts$restaurants < 5])` of the `r sum(nsa_counts$restaurants)` restaurants are in neighborhoods that are not ranked. A good restaurant in one of those neighborhoods can still appear in the top 10 restaurant list, but its neighborhood cannot win.
+
+The full Homework 6 comparison, including the top 10 areas for each system and a ZIP code cross check, is in [analysis.md](https://github.com/boseongkang/yelp/blob/main/analysis.md); it uses the earlier, broader inclusion rule.
+
+## Step 7: Ratings from all reviewers and from selected reviewers
+
+From here on, the study set is the East Asian restaurants that fall inside a New Orleans neighborhood.
+
+```{r}
+#| label: study-set
+study_restaurants <- selected_restaurants |>
+  inner_join(
+    assigned[["Neighborhood Statistical Area"]] |>
+      filter(!is.na(area_name)) |>
+      select(business_id, neighborhood = area_name),
+    by = "business_id"
+  )
+
+category_reviews <- reviews |>
+  semi_join(study_restaurants, by = "business_id") |>
+  mutate(
+    review_date = as_date(ymd_hms(date)),
+    review_year = year(review_date)
+  )
+
+tibble(
+  restaurants = nrow(study_restaurants),
+  reviews = nrow(category_reviews),
+  reviewers = n_distinct(category_reviews$user_id),
+  unparsed_dates = sum(is.na(category_reviews$review_date)),
+  first_review = min(category_reviews$review_date, na.rm = TRUE),
+  last_review = max(category_reviews$review_date, na.rm = TRUE)
+) |>
+  kable(caption = "Study set for the reviewer analysis")
+```
+
+The Yelp `date` field includes a time (for example `2017-01-14 20:54:15`), so it is parsed with `ymd_hms()`. Plain `ymd()`, used in the project template, would return `NA` for every review.
+
+### All reviewers
+
+```{r}
+#| label: all-reviewers
+all_reviewer_summary <- category_reviews |>
+  group_by(business_id) |>
+  summarise(
+    reviews_all = n(),
+    avg_stars_all = mean(stars, na.rm = TRUE),
+    median_stars_all = median(stars, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+all_reviewer_summary |>
+  left_join(study_restaurants |> select(business_id, business_name, neighborhood),
+            by = "business_id") |>
+  arrange(desc(avg_stars_all)) |>
+  select(business_name, neighborhood, reviews_all, avg_stars_all) |>
+  slice_head(n = 10) |>
+  kable(digits = 2, caption = "Highest raw averages (any number of reviews)")
+```
+
+```{r}
+#| label: raw-range
+#| include: false
+raw_top <- all_reviewer_summary |> slice_max(avg_stars_all, n = 10, with_ties = FALSE)
+```
+
+The ten highest raw averages come from restaurants with between `r min(raw_top$reviews_all)` and `r max(raw_top$reviews_all)` reviews. A raw average does not say how much evidence is behind it, and it cannot tell a generous reviewer from a great restaurant, which is why "best" also needs a minimum number of reviews and the reviewer adjustment below.
+
+### How active are the reviewers?
+
+A baseline for a reviewer needs several of that reviewer's own ratings. The template measures activity inside the selected category group. Because most people review only one or two East Asian restaurants, I also measured activity across all New Orleans restaurant reviews (476,421 reviews).
+
+```{r}
+#| label: reviewer-activity
+activity_category <- category_reviews |>
+  count(user_id, name = "n_category")
+
+activity_city <- reviews |>
+  semi_join(activity_category, by = "user_id") |>
+  count(user_id, name = "n_city")
+
+reviewer_activity <- activity_category |>
+  left_join(activity_city, by = "user_id")
+
+threshold_table <- map(c(1, 2, 3, 5, 10), \(k) tibble(
+  minimum_reviews = k,
+  reviewers_category = sum(reviewer_activity$n_category >= k),
+  share_of_reviews_category = sum(reviewer_activity$n_category[reviewer_activity$n_category >= k]) /
+    nrow(category_reviews),
+  reviewers_city = sum(reviewer_activity$n_city >= k),
+  share_of_reviews_city = sum(reviewer_activity$n_category[reviewer_activity$n_city >= k]) /
+    nrow(category_reviews)
+)) |>
+  list_rbind()
+
+threshold_table |>
+  mutate(across(starts_with("share"), \(x) scales::percent(x, accuracy = 0.1))) |>
+  kable(caption = "Reviewers retained and share of East Asian reviews they wrote, by minimum activity")
+
+write_csv(threshold_table, "output/threshold_table.csv")
+```
+
+### Normalizing each reviewer's scores
+
+For each reviewer, the baseline is their mean rating, and the normalized score of a review is its stars minus that baseline. A score of +1 means the reviewer rated this restaurant one star above their usual rating. This is not a new Yelp rating; it measures whether a reviewer liked this restaurant more or less than they usually like restaurants.
+
+Both a mean and a median baseline were tested, and the mean is the primary baseline. Stars are whole numbers, so a median baseline is usually a whole number too and can equal the rating itself, which sets the normalized score to exactly 0 and hides differences. The check after the next code chunk measures how often this happens.
+
+Two baselines are computed: the template's category baseline (mean over the reviewer's East Asian reviews) and a citywide baseline (mean over all of the reviewer's New Orleans restaurant reviews).
+
+```{r}
+#| label: normalize
+min_reviewer_reviews <- 5   # minimum reviews for a reviewer to be eligible
+
+baseline_category <- category_reviews |>
+  group_by(user_id) |>
+  summarise(base_category = mean(stars), n_category = n(), .groups = "drop")
+
+baseline_city <- reviews |>
+  semi_join(baseline_category, by = "user_id") |>
+  group_by(user_id) |>
+  summarise(base_city = mean(stars), n_city = n(), .groups = "drop")
+
+adjusted_reviews <- category_reviews |>
+  left_join(baseline_category, by = "user_id") |>
+  left_join(baseline_city, by = "user_id") |>
+  mutate(
+    norm_category = stars - base_category,
+    norm_city = stars - base_city,
+    eligible_category = n_category >= min_reviewer_reviews,
+    eligible_city = n_city >= min_reviewer_reviews
+  )
+
+summarise_adjusted <- function(df, eligible_col, norm_col, suffix) {
+  df |>
+    filter(.data[[eligible_col]]) |>
+    group_by(business_id) |>
+    summarise(
+      n_eligible = n(),
+      avg_stars_eligible = mean(stars),
+      avg_normalized = mean(.data[[norm_col]]),
+      median_normalized = median(.data[[norm_col]]),
+      .groups = "drop"
+    ) |>
+    rename_with(\(x) paste0(x, "_", suffix), -business_id)
+}
+
+restaurant_summary <- study_restaurants |>
+  select(business_id, business_name, neighborhood, cuisine, yelp_stars = stars,
+         latitude, longitude) |>
+  left_join(all_reviewer_summary, by = "business_id") |>
+  left_join(summarise_adjusted(adjusted_reviews, "eligible_category", "norm_category", "category"),
+            by = "business_id") |>
+  left_join(summarise_adjusted(adjusted_reviews, "eligible_city", "norm_city", "city"),
+            by = "business_id")
+
+tibble(
+  baseline = c("Category (East Asian reviews)", "Citywide (all New Orleans restaurant reviews)"),
+  eligible_reviewers = c(sum(baseline_category$n_category >= min_reviewer_reviews),
+                         sum(baseline_city$n_city >= min_reviewer_reviews)),
+  eligible_reviews = c(sum(adjusted_reviews$eligible_category),
+                       sum(adjusted_reviews$eligible_city)),
+  restaurants_with_5_eligible_reviews = c(
+    sum(restaurant_summary$n_eligible_category >= 5, na.rm = TRUE),
+    sum(restaurant_summary$n_eligible_city >= 5, na.rm = TRUE))
+) |>
+  kable(caption = "Coverage of the two baselines (reviewers with at least 5 reviews)")
+```
+
+```{r}
+#| label: mean-vs-median
+median_check <- category_reviews |>
+  group_by(user_id) |>
+  mutate(base_median = median(stars), n_rev = n()) |>
+  ungroup() |>
+  filter(n_rev >= min_reviewer_reviews) |>
+  left_join(baseline_category |> select(user_id, base_category), by = "user_id") |>
+  summarise(
+    eligible_reviews = n(),
+    zero_mean = mean(abs(stars - base_category) < 1e-9),
+    zero_median = mean(abs(stars - base_median) < 1e-9)
+  )
+
+median_check |>
+  mutate(across(starts_with("zero"), \(x) paste0(round(100 * x, 1), "%"))) |>
+  kable(col.names = c("Eligible reviews (category baseline)",
+                      "Normalized score exactly 0, mean baseline",
+                      "Normalized score exactly 0, median baseline"),
+        caption = "How often each baseline gives a normalized score of exactly 0")
+```
+
+With the median baseline `r round(100 * median_check$zero_median, 1)`% of eligible reviews get a normalized score of exactly 0, against `r round(100 * median_check$zero_mean, 1)`% with the mean baseline. `r if (median_check$zero_median > median_check$zero_mean) "The median erases the difference between the rating and the reviewer's habit for many more reviews, so the mean is used." else "The median does not produce more zeros here; the mean is still used because it uses every rating of the reviewer rather than only the middle one."`
+
+```{r}
+#| label: choose-baseline
+#| include: false
+coverage_category <- sum(restaurant_summary$n_eligible_category >= 5, na.rm = TRUE)
+coverage_city <- sum(restaurant_summary$n_eligible_city >= 5, na.rm = TRUE)
+
+# Use the template's category baseline unless it leaves fewer than 10 restaurants
+# with enough eligible reviews to rank a top 10.
+primary <- if (coverage_category >= 10) "category" else "city"
+primary_label <- if (primary == "category") "category baseline" else "citywide baseline"
+
+restaurant_summary <- restaurant_summary |>
+  mutate(
+    n_eligible = .data[[paste0("n_eligible_", primary)]],
+    avg_normalized = .data[[paste0("avg_normalized_", primary)]],
+    median_normalized = .data[[paste0("median_normalized_", primary)]]
+  )
+```
+
+**Primary score: `r primary_label`.** The rule, set before looking at the rankings, was to use the template's category baseline if at least 10 restaurants have 5 or more eligible reviews under it, and otherwise to use the citywide baseline. Under the category baseline `r coverage_category` restaurants qualify; under the citywide baseline `r coverage_city` do. The citywide baseline is kept as a sensitivity check after the top 10 below: it measures each reviewer's habits on more ratings, but those ratings come from all kinds of restaurants, not only East Asian ones.
+
+### Raw and adjusted results compared
+
+```{r}
+#| label: fig-raw-vs-adjusted
+#| fig-cap: "Raw average stars against the reviewer adjusted score for each restaurant"
+#| fig-width: 8
+#| fig-height: 5
+restaurant_summary |>
+  filter(n_eligible >= 5) |>
+  ggplot(aes(x = avg_stars_all, y = avg_normalized)) +
+  geom_hline(yintercept = 0, color = "grey70") +
+  geom_point(aes(size = reviews_all, color = cuisine), alpha = 0.7) +
+  scale_color_manual(values = c(Korean = "#C0392B", Japanese = "#2E86C1",
+                                Chinese = "#D4AC0D")) +
+  labs(
+    title = "Raw Restaurant Ratings Compared with Reviewer Adjusted Scores",
+    subtitle = "Restaurants with at least 5 reviews from eligible reviewers",
+    x = "Average stars from all reviewers",
+    y = "Average normalized score",
+    size = "Reviews", color = "Cuisine"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+#| label: rank-changes
+ranked <- restaurant_summary |>
+  filter(n_eligible >= 5) |>
+  mutate(
+    rank_raw = min_rank(desc(avg_stars_all)),
+    rank_adjusted = min_rank(desc(avg_normalized)),
+    rank_change = rank_raw - rank_adjusted
+  )
+
+ranked |>
+  arrange(desc(abs(rank_change))) |>
+  select(business_name, neighborhood, reviews_all, n_eligible,
+         avg_stars_all, avg_normalized, rank_raw, rank_adjusted, rank_change) |>
+  slice_head(n = 10) |>
+  kable(digits = 2, caption = "Restaurants whose rank changes most after adjustment (positive = moves up)")
+```
+
+```{r}
+#| label: rank-discussion
+#| include: false
+rank_cor <- cor(ranked$avg_stars_all, ranked$avg_normalized)
+move_vs_n <- cor(abs(ranked$rank_change), ranked$n_eligible, method = "spearman")
+movers <- ranked |> slice_max(abs(rank_change), n = 10, with_ties = FALSE)
+
+baseline_by_restaurant <- adjusted_reviews |>
+  filter(.data[[paste0("eligible_", primary)]]) |>
+  group_by(business_id) |>
+  summarise(reviewer_baseline = mean(.data[[paste0("base_", primary)]]), .groups = "drop")
+
+movers <- movers |> left_join(baseline_by_restaurant, by = "business_id")
+all_eligible_baseline <- adjusted_reviews |>
+  filter(.data[[paste0("eligible_", primary)]]) |>
+  pull(paste0("base_", primary)) |>
+  mean()
+
+raw_top10_ranked <- ranked |> slice_min(rank_raw, n = 10, with_ties = FALSE)
+adj_top10_ranked <- ranked |> slice_min(rank_adjusted, n = 10, with_ties = FALSE)
+overlap_raw_adj <- length(intersect(raw_top10_ranked$business_id, adj_top10_ranked$business_id))
+```
+
+**Why ranks change.** Among the `r nrow(ranked)` restaurants with at least 5 eligible reviews, the raw average and the adjusted score agree broadly (correlation `r round(rank_cor, 2)`), and `r overlap_raw_adj` of the raw top 10 are also in the adjusted top 10. Individual ranks still move. The instructions ask whether the moves reflect reviewer behavior or small samples; the data answer this as follows:
+
+1. **Small samples.** The 10 restaurants that move most have a median of `r median(movers$n_eligible)` eligible reviews, against `r median(ranked$n_eligible)` for all ranked restaurants. Across all ranked restaurants, the size of a move and the number of eligible reviews have a Spearman correlation of `r round(move_vs_n, 2)`. `r if (abs(move_vs_n) < 0.2) 'This relationship is weak, so small samples explain little of the movement; restaurants with many eligible reviews move about as much as those with few.' else if (move_vs_n <= -0.2) 'Restaurants with fewer eligible reviews move more, so part of the movement is noise from small samples.' else 'Restaurants with more eligible reviews move more, so small samples are not the main driver.'`
+2. **Reviewer behavior.** The adjustment rewards a restaurant when its reviewers rate it above their own habit. The restaurants that fall most were reviewed by people whose usual rating is `r round(mean(movers$reviewer_baseline[movers$rank_change < 0]), 2)` stars on average, and the ones that rise most by people whose usual rating is `r round(mean(movers$reviewer_baseline[movers$rank_change > 0]), 2)` stars, against `r round(all_eligible_baseline, 2)` for all eligible reviews. A high raw average from generous reviewers counts for less than the same average from strict reviewers, which is the intended effect. `r if (mean(movers$reviewer_baseline[movers$rank_change < 0]) > mean(movers$reviewer_baseline[movers$rank_change > 0])) 'This difference in reviewer habits is the clearer of the two explanations for the rank changes.' else ''`
+
+## The top 10 East Asian restaurants
+
+**Rule.** A restaurant can be ranked if it has at least 20 reviews in total and at least 5 reviews from eligible reviewers. Qualifying restaurants are ranked by their average normalized score; ties are broken by the raw average.
+
+```{r}
+#| label: top10
+min_total_reviews <- 20
+min_eligible <- 5
+
+qualified <- restaurant_summary |>
+  filter(reviews_all >= min_total_reviews, n_eligible >= min_eligible)
+
+top10 <- qualified |>
+  arrange(desc(avg_normalized), desc(avg_stars_all)) |>
+  slice_head(n = 10) |>
+  mutate(rank = row_number())
+
+nrow(qualified)
+
+top10 |>
+  select(rank, business_name, cuisine, neighborhood, reviews_all,
+         avg_stars_all, n_eligible, avg_normalized) |>
+  kable(digits = 2, col.names = c("Rank", "Restaurant", "Cuisine", "Neighborhood",
+                                  "Reviews", "Raw average", "Eligible reviews",
+                                  "Normalized score"),
+        caption = "Top 10 East Asian restaurants in New Orleans")
+
+write_csv(select(restaurant_summary, -latitude, -longitude), "output/restaurant_summary.csv")
+```
+
+### How the top 10 changes with the reviewer threshold and baseline
+
+The same ranking rule is repeated with a reviewer minimum of 3, 5, and 10 reviews and with both baselines. The table counts how many of the main top 10 (category baseline, minimum 5) would still be in the top 10.
+
+```{r}
+#| label: sensitivity
+rank_under <- function(base, k_reviewer) {
+  q <- adjusted_reviews |>
+    filter(.data[[paste0("n_", base)]] >= k_reviewer) |>
+    group_by(business_id) |>
+    summarise(n_elig = n(), score = mean(.data[[paste0("norm_", base)]]),
+              .groups = "drop") |>
+    inner_join(all_reviewer_summary, by = "business_id") |>
+    filter(reviews_all >= min_total_reviews, n_elig >= min_eligible)
+  list(
+    n = nrow(q),
+    ids = q |> arrange(desc(score), desc(avg_stars_all)) |> slice_head(n = 10) |> pull(business_id)
+  )
+}
+
+sensitivity <- expand_grid(baseline = c("category", "city"),
+                           min_reviewer_reviews = c(3, 5, 10)) |>
+  mutate(
+    res = map2(baseline, min_reviewer_reviews, rank_under),
+    restaurants_qualified = map_int(res, "n"),
+    ids = map(res, "ids"),
+    restaurants_in_top10 = map_int(ids, length),
+    same_as_main_top10 = map_int(ids, \(x) length(intersect(x, top10$business_id))),
+    number_one = map_chr(ids, \(x) if (length(x) > 0)
+      study_restaurants$business_name[match(x[1], study_restaurants$business_id)]
+      else NA_character_)
+  ) |>
+  select(-res, -ids)
+
+sensitivity |>
+  kable(caption = "Top 10 under different reviewer thresholds and baselines")
+
+write_csv(sensitivity, "output/sensitivity.csv")
+
+robust <- sensitivity |>
+  filter(!(baseline == .env$primary &
+             min_reviewer_reviews == .env$min_reviewer_reviews))
+```
+
+Across the other five settings, between `r min(robust$same_as_main_top10)` and `r max(robust$same_as_main_top10)` of the main top 10 stay in the top 10. `r if (min(robust$same_as_main_top10) >= 6) 'Most of the list is stable in every setting.' else paste0(sum(robust$same_as_main_top10 >= 7), ' of these 5 settings keep at least 7, so most of the list holds, but the setting that keeps only ', min(robust$same_as_main_top10), ' shows that the list is not fixed.')` The order at the very top is not: `r top10$business_name[1]` is first in `r sum(sensitivity$number_one == top10$business_name[1])` of the 6 settings, and the other settings put `r paste(setdiff(unique(sensitivity$number_one), top10$business_name[1]), collapse = ", ")` first. With the category baseline, raising the reviewer minimum from 3 to 10 reduces the qualifying restaurants from `r sensitivity$restaurants_qualified[sensitivity$baseline == 'category' & sensitivity$min_reviewer_reviews == 3]` to `r sensitivity$restaurants_qualified[sensitivity$baseline == 'category' & sensitivity$min_reviewer_reviews == 10]`, because few people write many East Asian reviews; with the citywide baseline the count barely changes (`r paste(sensitivity$restaurants_qualified[sensitivity$baseline == 'city'], collapse = ', ')`), because most reviewers have many New Orleans reviews. A higher reviewer minimum keeps only very active reviewers; a lower minimum lets reviewers with only a few ratings set their own baseline, which makes their normalized scores less meaningful.
+
+```{r}
+#| label: top10-csv
+#| include: false
+write_csv(select(top10, rank, business_name, cuisine, neighborhood, reviews_all,
+                 avg_stars_all, n_eligible, avg_normalized),
+          "output/top10.csv")
+```
+
+### Final map
+
+```{r}
+#| label: fig-final-map
+#| fig-cap: "Top 10 East Asian restaurants with Neighborhood Statistical Area boundaries; ranked neighborhoods are shaded and named"
+#| fig-width: 9
+#| fig-height: 7
+ranked_neighborhoods <- nsa_counts |>
+  filter(restaurants >= 5) |>
+  pull(area_name)
+
+nsa_map <- nsa |>
+  mutate(ranked = area_name %in% ranked_neighborhoods)
+
+study_points <- study_restaurants |>
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+top10_points <- top10 |>
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE)
+
+hood_anchor <- nsa_map |>
+  filter(ranked) |>
+  st_point_on_surface()
+
+map_labels <- bind_rows(
+  tibble(x = top10$longitude, y = top10$latitude,
+         label = paste0(top10$rank, ". ", top10$business_name),
+         face = "plain", col = "black"),
+  tibble(x = st_coordinates(hood_anchor)[, 1], y = st_coordinates(hood_anchor)[, 2],
+         label = hood_anchor$area_name, face = "italic", col = "grey30")
+)
+
+zoom <- st_bbox(study_points)
+pad <- 0.01
+
+final_map <- ggplot() +
+  geom_sf(data = nsa_map, aes(fill = ranked), color = "grey55", linewidth = 0.2) +
+  scale_fill_manual(values = c(`TRUE` = "#FDEBD0", `FALSE` = "grey97"),
+                    labels = c(`TRUE` = "5 or more East Asian restaurants",
+                               `FALSE` = "Fewer than 5"),
+                    name = "Neighborhood") +
+  geom_sf(data = study_points, color = "grey50", size = 0.9, alpha = 0.6) +
+  geom_sf(data = top10_points, color = "#C0392B", size = 3) +
+  geom_label_repel(
+    data = map_labels,
+    aes(x = x, y = y, label = label, fontface = face, colour = col),
+    size = 3, min.segment.length = 0, box.padding = 0.6, max.overlaps = Inf,
+    label.size = 0.2, seed = 167
+  ) +
+  scale_colour_identity() +
+  coord_sf(xlim = c(zoom["xmin"] - pad, zoom["xmax"] + pad),
+           ylim = c(zoom["ymin"] - pad, zoom["ymax"] + pad)) +
+  labs(
+    title = "Top 10 East Asian Restaurants in New Orleans",
+    subtitle = "Ranked by reviewer adjusted score; boundaries are Neighborhood Statistical Areas",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+final_map
+ggsave("figures/final_top10_map.png", final_map, width = 9, height = 7, dpi = 150)
+```
+
+## Which neighborhood is best?
+
+Neighborhoods with at least 5 East Asian restaurants are compared with the raw average and the reviewer adjusted score. Both are averages over reviews: the raw average is the mean star rating of all reviews of the neighborhood's East Asian restaurants, and the adjusted score is the mean normalized score of the eligible reviews. Using the same weighting for both keeps the raw and adjusted ranks comparable; in both, a restaurant with many reviews counts for more than one with few.
+
+```{r}
+#| label: neighborhood-ranking
+neighborhood_comparison <- category_reviews |>
+  inner_join(study_restaurants |> select(business_id, neighborhood), by = "business_id") |>
+  filter(neighborhood %in% ranked_neighborhoods) |>
+  group_by(neighborhood) |>
+  summarise(
+    restaurants = n_distinct(business_id),
+    total_reviews = n(),
+    avg_raw = mean(stars),
+    .groups = "drop"
+  ) |>
+  left_join(
+    adjusted_reviews |>
+      filter(.data[[paste0("eligible_", primary)]]) |>
+      inner_join(study_restaurants |> select(business_id, neighborhood), by = "business_id") |>
+      group_by(neighborhood) |>
+      summarise(eligible_reviews = n(),
+                avg_adjusted = mean(.data[[paste0("norm_", primary)]]),
+                reviewer_baseline = mean(.data[[paste0("base_", primary)]]),
+                .groups = "drop"),
+    by = "neighborhood"
+  ) |>
+  left_join(top10 |> count(neighborhood, name = "top10_restaurants"), by = "neighborhood") |>
+  mutate(
+    top10_restaurants = replace_na(top10_restaurants, 0),
+    rank_raw = min_rank(desc(avg_raw)),
+    rank_adjusted = min_rank(desc(avg_adjusted))
+  ) |>
+  arrange(rank_adjusted)
+
+neighborhood_comparison |>
+  kable(digits = 2, caption = "Neighborhoods with at least 5 East Asian restaurants")
+
+write_csv(neighborhood_comparison, "output/neighborhood_comparison.csv")
+
+hood_mover <- neighborhood_comparison |>
+  mutate(move = rank_raw - rank_adjusted,
+         eligible_stars = avg_adjusted + reviewer_baseline) |>
+  slice_max(move, n = 1, with_ties = FALSE)
+
+mean_base <- mean(neighborhood_comparison$reviewer_baseline)
+mover_strict <- hood_mover$reviewer_baseline < mean_base
+mover_higher <- hood_mover$eligible_stars > hood_mover$avg_raw
+mover_reason <- if (mover_strict && mover_higher) {
+  "Both effects help: these reviewers are stricter than average, and they still rate these restaurants above reviewers overall."
+} else if (mover_strict) {
+  "The rise comes from strict reviewers: their stars are not higher than everyone else's, but they are high compared with what these reviewers usually give."
+} else if (mover_higher) {
+  "The rise is not caused by strict reviewers, because their usual rating is above average. It comes from the active reviewers rating these restaurants higher than reviewers overall do, so the move reflects which reviewers are counted rather than reviewer strictness."
+} else {
+  "Neither effect applies; the move comes from other neighborhoods falling after the adjustment."
+}
+```
+
+`reviewer_baseline` is the usual rating of the eligible reviewers in each neighborhood (their mean over all of their `r if (primary == "category") "East Asian" else "New Orleans restaurant"` reviews). `r if (hood_mover$move > 0) paste0("The largest move is ", hood_mover$neighborhood, ", from raw rank ", hood_mover$rank_raw, " to adjusted rank ", hood_mover$rank_adjusted, ". Its eligible reviewers give its East Asian restaurants ", round(hood_mover$eligible_stars, 2), " stars on average, against ", round(hood_mover$avg_raw, 2), " from all reviewers, and their usual rating is ", round(hood_mover$reviewer_baseline, 2), " against an average of ", round(mean_base, 2), " across these neighborhoods. ", mover_reason) else "No neighborhood moves up after the adjustment."`
+
+### Cross check with ZIP codes
+
+The same rule (at least 5 East Asian restaurants, adjusted score from eligible reviews) is applied to ZIP codes to see whether the top neighborhood is also in a top ZIP code.
+
+```{r}
+#| label: zip-check
+zip_lookup <- assigned[["ZIP/ZCTA"]] |>
+  filter(!is.na(area_name)) |>
+  select(business_id, zcta = area_name)
+
+zip_ranked <- adjusted_reviews |>
+  filter(.data[[paste0("eligible_", primary)]]) |>
+  inner_join(zip_lookup, by = "business_id") |>
+  group_by(zcta) |>
+  summarise(eligible_reviews = n(),
+            avg_adjusted = mean(.data[[paste0("norm_", primary)]]),
+            .groups = "drop") |>
+  inner_join(study_restaurants |> inner_join(zip_lookup, by = "business_id") |>
+               count(zcta, name = "restaurants"), by = "zcta") |>
+  filter(restaurants >= 5) |>
+  mutate(rank_adjusted = min_rank(desc(avg_adjusted))) |>
+  arrange(rank_adjusted)
+
+zip_ranked |>
+  kable(digits = 2, caption = "ZIP codes with at least 5 East Asian restaurants, ranked by adjusted score")
+
+best_hood <- neighborhood_comparison |> filter(rank_adjusted == 1) |> pull(neighborhood)
+
+best_hood_zips <- study_restaurants |>
+  filter(neighborhood %in% best_hood) |>
+  inner_join(zip_lookup, by = "business_id") |>
+  count(zcta, name = "restaurants") |>
+  left_join(zip_ranked |> select(zcta, rank_adjusted), by = "zcta")
+
+best_hood_zips |>
+  kable(caption = paste("ZIP codes of the restaurants in", paste(best_hood, collapse = " and ")))
+
+top_zip <- zip_ranked$zcta[1]
+main_zip <- best_hood_zips |> slice_max(restaurants, n = 1, with_ties = FALSE)
+main_zip_total <- zip_ranked$restaurants[zip_ranked$zcta == main_zip$zcta]
+main_zip_share <- adjusted_reviews |>
+  filter(.data[[paste0("eligible_", primary)]]) |>
+  inner_join(zip_lookup, by = "business_id") |>
+  filter(zcta == main_zip$zcta) |>
+  left_join(study_restaurants |> select(business_id, neighborhood), by = "business_id") |>
+  summarise(share = mean(neighborhood %in% best_hood)) |>
+  pull(share)
+```
+
+The `r sum(best_hood_zips$restaurants)` restaurants in `r paste(best_hood, collapse = " and ")` fall in ZIP code(s) `r paste(best_hood_zips$zcta, collapse = ", ")`, ranked `r paste(ifelse(is.na(best_hood_zips$rank_adjusted), "unranked", best_hood_zips$rank_adjusted), collapse = ", ")` of `r nrow(zip_ranked)` ranked ZIP codes. Under ZIP codes the first place goes to `r top_zip`. `r if (main_zip$zcta == top_zip) 'The ZIP code of the top neighborhood is also first.' else paste0('The ZIP code of the top neighborhood, ', main_zip$zcta, ', is ranked ', main_zip$rank_adjusted, '.')` This check is not fully independent: `r main_zip$restaurants` of the `r main_zip_total` East Asian restaurants in `r main_zip$zcta` are in `r paste(best_hood, collapse = " and ")`, and they supply `r round(100 * main_zip_share)`% of its eligible reviews, so the ZIP score largely repeats the neighborhood score. The fair reading is that the best area depends on the boundary: with neighborhoods it is `r paste(best_hood, collapse = " and ")`, with ZIP codes it is `r top_zip`.
+
+```{r}
+#| label: fig-neighborhoods
+#| fig-cap: "Reviewer adjusted score of each ranked neighborhood"
+#| fig-width: 8
+#| fig-height: 5
+neighborhood_comparison |>
+  mutate(neighborhood = fct_reorder(neighborhood, avg_adjusted)) |>
+  ggplot(aes(x = avg_adjusted, y = neighborhood)) +
+  geom_vline(xintercept = 0, color = "grey70") +
+  geom_col(aes(fill = restaurants)) +
+  scale_fill_viridis_c(option = "C", direction = -1) +
+  labs(
+    title = "Reviewer Adjusted Score by Neighborhood",
+    subtitle = "Positive = reviewers rated these restaurants above their usual level",
+    x = "Average normalized score of eligible reviews", y = NULL,
+    fill = "Restaurants"
+  ) +
+  theme_minimal()
+
+ggsave("figures/neighborhood_adjusted.png", width = 8, height = 5, dpi = 150)
+```
+
+## Executive summary
+
+```{r}
+#| label: summary-values
+#| include: false
+best_raw <- neighborhood_comparison |> filter(rank_raw == 1) |> pull(neighborhood)
+best_adj <- neighborhood_comparison |> filter(rank_adjusted == 1) |> pull(neighborhood)
+most_top10 <- neighborhood_comparison |> filter(top10_restaurants == max(top10_restaurants)) |>
+  pull(neighborhood)
+top10_in_ranked <- sum(top10$neighborhood %in% ranked_neighborhoods)
+most_choice <- neighborhood_comparison |> slice_max(restaurants, n = 1, with_ties = FALSE)
+n_first <- sum(sensitivity$number_one == top10$business_name[1])
+adj_sorted <- sort(neighborhood_comparison$avg_adjusted, decreasing = TRUE)
+raw_sorted <- sort(neighborhood_comparison$avg_raw, decreasing = TRUE)
+best_hood_n <- neighborhood_comparison$restaurants[neighborhood_comparison$rank_adjusted == 1][1]
+```
+
+* The highest ranked East Asian restaurant is **`r top10$business_name[1]`** (`r top10$cuisine[1]`, `r top10$neighborhood[1]`), with `r top10$reviews_all[1]` reviews and a raw average of `r round(top10$avg_stars_all[1], 2)` stars. Its rank rests on `r top10$n_eligible[1]` eligible reviews and it is first in `r n_first` of the 6 sensitivity settings, so the top 10 as a group is more reliable than the exact order at the top.
+* By the raw average the best neighborhood is **`r paste(best_raw, collapse = " and ")`**; after removing reviewer habits it is **`r paste(best_adj, collapse = " and ")`**. `r if (setequal(best_raw, best_adj)) "The adjustment does not change the top neighborhood." else paste0("The raw lead is only ", round(raw_sorted[1] - raw_sorted[2], 2), " stars (", round(raw_sorted[1], 2), " against ", round(raw_sorted[2], 2), "), so on raw averages the top neighborhoods are close to a tie, and the adjustment separates them.")` The margin is small (adjusted score `r round(adj_sorted[1], 2)` against `r round(adj_sorted[2], 2)` for second place), and the top neighborhood has `r best_hood_n` East Asian restaurants, so it is a narrow lead rather than a clear winner.
+* **The best restaurants and the best neighborhood are partly different answers.** `r top10_in_ranked` of the top 10 restaurants are in one of the `r length(ranked_neighborhoods)` neighborhoods with at least 5 East Asian restaurants; the other `r 10 - top10_in_ranked` are in neighborhoods with fewer than 5 East Asian options`r if (!(top10$neighborhood[1] %in% ranked_neighborhoods)) paste0(", including the number one restaurant, ", top10$business_name[1], ", in ", top10$neighborhood[1]) else ""`.
+* For choice, **`r most_choice$neighborhood`** has the most East Asian restaurants (`r most_choice$restaurants`) and ranks `r most_choice$rank_adjusted` of `r nrow(neighborhood_comparison)` by the adjusted score.
+* These results use `r nrow(category_reviews)` reviews of `r nrow(study_restaurants)` restaurants inside the city; the reviewer adjusted score uses the `r primary_label` and only reviewers with at least `r min_reviewer_reviews` reviews.
+
+## Limitations
+
+1. **Data age.** The Yelp files were published in January 2022, so some restaurants may have closed or changed since.
+2. **Yelp users are not all diners.** Restaurants popular with visitors and Yelp users are better represented than places used mainly by local residents.
+3. **Small numbers.** Even with the minimum rules, several neighborhoods are compared using 5 to 10 restaurants, and a single restaurant can move a neighborhood's average.
+4. **The adjustment is relative.** A normalized score says a reviewer liked a restaurant more than they usually do; it does not say the food is objectively better.
+5. **Boundary choice.** The best area depends on the boundaries: with neighborhoods it is `r paste(best_hood, collapse = " and ")`, with ZIP codes it is `r top_zip`, and the ZIP check largely reuses the same restaurants, so it is not an independent confirmation.
+6. **Mailing addresses.** Restaurants with a New Orleans address but coordinates outside the city were excluded from the neighborhood analysis.
+7. **Category tags.** The inclusion rule depends on Yelp's category tags. Excluding restaurants that also carry an outside the theme cuisine removes clear mismatches, but it can also remove a genuine East Asian restaurant with an extra tag, and it cannot catch a mismatch that has no such tag.
+8. **Few active reviewers.** The reviewer adjusted score uses only reviewers with at least `r min_reviewer_reviews` East Asian reviews, a small share of all reviewers (see the activity table in Step 7).
+9. **Thin evidence at the top of the restaurant list.** `r sum(top10$n_eligible <= 10)` of the top 10 restaurants rank on 10 or fewer eligible reviews, and the number one changes in some sensitivity settings. The list identifies a group of strong restaurants; the exact order within it is uncertain.
+
+## AI prompts and how I reprompted
+
+I used Claude (Anthropic) throughout the project. My prompts were in Korean; they are translated here. These are the cases where my prompt or my review of the output changed the analysis.
+
+1. **Choosing the theme.**
+   *Prompt:* "I'm Korean, so I'd like to do Korean restaurants. Can I compare by state, for example California, which has many Korean Americans, against the Midwest?"
+   *Result:* The AI said the project is limited to New Orleans and that the Yelp Open Dataset covers only 11 metropolitan areas, so a state comparison would really compare a few cities. I kept Korean food as the starting point inside New Orleans.
+2. **Checking whether Korean alone was enough.** I ran the count code and found only 6 Korean restaurants.
+   *Reprompt:* I shared the count and the categories that appear with Korean. The AI suggested widening to East Asian food, and I asked for the counts of every Asian category before deciding which to include and exclude.
+3. **Rejecting an idea that did not fit the question.**
+   *Prompt:* "New Orleans is a mostly Black city. Could I use population statistics by race and split restaurants into Asian, American, and so on?"
+   *Result:* The AI explained that this would change the project into several questions, that restaurant locations follow commercial streets and tourists more than residents, and that linking residents' race to cuisine is an ecological inference. I kept one focused question and noted demographics as possible future work.
+4. **Finding bugs by reading the output.** In the first render, the "unmatched restaurants" table showed restaurant names in the column that should name the geographic system, and the area tables printed as plain text. I sent screenshots; the cause was a function argument named `name`, which collided with Yelp's `name` column. Both were fixed.
+5. **Asking for evidence behind a claim.**
+   *Prompt:* "Is the reason for choosing the region strong enough?"
+   *Result:* The AI pointed out that the report claimed ZIP codes were used as a check but showed no check, and that the minimum of 5 restaurants looked arbitrary. We added a table comparing minimums of 3, 5, and 10 and a ZIP code cross check. In Homework 6, with the earlier restaurant set, that check showed the top neighborhood held under ZIP codes but the order below it did not. The check was redone for the final rule (see Cross check with ZIP codes), where the result is weaker, and case 10 explains why.
+6. **Investigating a mismatch instead of deleting it.** During a final review of the rendered report, the ZIP table of restaurants outside the city showed one restaurant with an Uptown New Orleans ZIP code (70115). Instead of grouping it with the suburban addresses, the report describes it as a probable coordinate or boundary issue.
+7. **Large file import.** The template reads the whole review file into memory. The AI proposed reading it in chunks with a `stream_in()` handler that keeps only New Orleans reviews. I ran it and checked that the number of records read (6,990,280) matched Yelp's published review count, so the full file was used.
+8. **Reviewer baseline.** Before writing Step 7, the AI warned that 18,141 reviews from about 12,500 reviewers (the first version of the restaurant set, before the inclusion rule was tightened) means most people wrote one or two East Asian reviews, so a category only baseline could leave too few eligible reviewers. We decided on a rule in advance (use the category baseline if it leaves at least 10 rankable restaurants, otherwise the citywide baseline) before looking at the rankings.
+9. **Checking the top 10 against reality.** After the first full render, the AI read the top 10 together with each restaurant's Yelp categories and flagged that four of the ten were not East Asian restaurants: a seafood and Cajun restaurant whose tags even include "Barbers", a seafood market, a Peruvian restaurant, and a Vietnamese bakery. Each had picked up a secondary "Chinese" or "Japanese" tag. It offered three options: keep the rule and report the problem as a limitation, exclude restaurants that also carry a cuisine already declared outside the theme, or exclude any non East Asian cuisine tag (which would also drop ordinary sushi restaurants tagged "American (New)"). I chose the middle option. After the next render, two poke bowl shops were still in the top 10 because they carry Japanese or sushi tags; since poke had already been excluded as a category, I asked to remove them too, and Hawaiian was added to the list (removing by the Poke tag would also have removed a ramen shop). The AI also recommended keeping the neighborhood minimum of 5 unchanged even though St. Claude, the top neighborhood in the first version, fell below 5 restaurants, because lowering the minimum after seeing the results would be choosing a rule to get a preferred answer. In the same review it corrected an earlier statement from Homework 6 that had mixed up the 7 area requirement with the number of ranked neighborhoods.
+10. **Independent check before submitting.** I asked for the finished report to be checked against the assignment. The check was done by a separate AI agent that had not seen how the report was made and only received the instructions, the rendered report, and the README. It found that the report printed the rank change table without discussing whether the changes came from reviewer behavior or small samples, that a limitation cited a ZIP code check from the older version, that the summary stated the top restaurant and neighborhood without saying how thin the evidence was, and that the raw and adjusted neighborhood scores used different weightings. Each point was fixed: the discussion of rank changes, a new ZIP code check, the caveats in the summary, and review weighted neighborhood scores were added. A second pass by the same agent then found that the new ZIP check reused mostly the same restaurants and that its conclusion ("the result largely holds") overstated the evidence, and that the raw neighborhood winner led by only 0.01 stars. The ZIP conclusion was rewritten to say that the best area depends on the boundary, and the summary now reports the raw margin.
+
+## Reproducibility
+
+```{r}
+#| label: session
+sessionInfo()
+```

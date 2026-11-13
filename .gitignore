@@ -7,3 +7,7 @@ data/raw/
 .Rhistory
 .RData
 .DS_Store
+
+/.quarto/
+**/*.quarto_ipynb
+.RDataTmp
